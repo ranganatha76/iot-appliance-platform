@@ -1,4 +1,4 @@
-# IoT Appliance Platform: Design and Operating Guide
+# IoT Appliance Platform: Design
 
 ## Purpose
 
@@ -6,242 +6,32 @@ This service provides one REST API for household appliances that may originate f
 
 The project intentionally uses a local H2 database and deterministic mocked vendor behavior. It is runnable without accounts, appliances, cloud resources, or credentials.
 
-## Prerequisites
+All installation, startup, testing, API usage, and end-to-end `curl` examples are in [README.md](README.md). This document explains the technical decisions, internal design, and code structure.
 
-| Requirement | Version | Check |
-|---|---:|---|
-| Java | 21 | `java --version` |
-| Maven | 3.9+ | `mvn --version` |
+## Why H2 Database
 
-On macOS with Homebrew, install the prerequisites with:
+H2 is an embedded relational Java database. In this service it runs in memory within the Spring Boot process through the JDBC URL `jdbc:h2:mem:appliances`.
 
-```bash
-brew install openjdk@21 maven
-```
+### How H2 is used
 
-Set Java 21 for the terminal session:
+- Spring Data JPA maps `Appliance` and `MetricObservation` Java entities to relational tables.
+- H2 persists registered appliances, each collection timestamp, and every metric observation for the lifetime of the running process.
+- The H2 console is enabled locally so a reviewer can inspect stored appliance and metric rows without needing a separate database tool.
+- Hibernate creates or updates the local schema from the entity definitions because `spring.jpa.hibernate.ddl-auto` is set to `update`.
 
-```bash
-export JAVA_HOME="/opt/homebrew/opt/openjdk@21"
-export PATH="$JAVA_HOME/bin:$PATH"
-```
+### Why it fits this scenario
 
-## Start, Stop, and Test
+| Advantage | Value for this take-home assignment |
+|---|---|
+| No infrastructure dependency | A reviewer can clone the source, start the application, and exercise historical metric collection immediately. No Docker, database server, account, or secret is required. |
+| Real relational persistence behavior | The implementation uses JPA entities, repositories, relationships, timestamp filtering, and aggregation over persisted observations rather than keeping data only in application memory collections. |
+| Fast startup and test isolation | Each integration test starts with an empty in-memory database and does not depend on state left by a previous run. |
+| Inspectable state | The H2 web console allows direct inspection of the appliance configuration and historical observation tables during local review. |
+| Portable Java dependency | H2 is a Maven runtime dependency, so it behaves consistently on supported developer machines. |
 
-From the repository root:
+### Tradeoffs and production path
 
-```bash
-mvn spring-boot:run
-```
-
-Spring Boot listens on `http://localhost:8080`. Open `http://localhost:8080/` in a browser to get the JSON API index. Stop the process with `Ctrl+C`.
-
-Run the integration suite without starting a separate server:
-
-```bash
-mvn test
-```
-
-The suite verifies root discovery, registration-to-report collection flow, and `400`/`404` error responses.
-
-## Configuration
-
-`src/main/resources/application.yml` configures the application:
-
-| Property | Default | Meaning |
-|---|---:|---|
-| `spring.datasource.url` | `jdbc:h2:mem:appliances;DB_CLOSE_DELAY=-1;MODE=PostgreSQL` | In-memory database kept alive while the application runs. |
-| `spring.jpa.hibernate.ddl-auto` | `update` | Creates or updates local schema from JPA entities. |
-| `spring.h2.console.enabled` | `true` | Enables the local H2 console at `/h2-console`. |
-| `collection.scheduler-delay-ms` | `5000` | How often the scheduler checks for appliances that are due. |
-
-The H2 console URL is `http://localhost:8080/h2-console`. Use JDBC URL `jdbc:h2:mem:appliances`, user `sa`, and an empty password. The database is intentionally erased when the process stops.
-
-## End-to-End Example
-
-Set a base URL and use ISO-8601 UTC timestamps in all time-range requests:
-
-```bash
-BASE_URL=http://localhost:8080
-START=$(date -u -v-5M +%Y-%m-%dT%H:%M:%SZ)
-END=$(date -u -v+5M +%Y-%m-%dT%H:%M:%SZ)
-```
-
-On Linux, replace the `date` commands with:
-
-```bash
-START=$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
-END=$(date -u -d '5 minutes' +%Y-%m-%dT%H:%M:%SZ)
-```
-
-### 1. Discover the API
-
-```bash
-curl "$BASE_URL/"
-```
-
-Expected shape:
-
-```json
-{
-  "service": "IoT Appliance Platform",
-  "endpoints": {
-    "appliances": "/api/appliances",
-    "collect": "/api/collections/run"
-  }
-}
-```
-
-### 2. Add appliances
-
-Register a refrigerator. `name`, `type`, `vendor`, and a positive `collectionIntervalSeconds` are required. `enabled` is optional on creation and defaults to `true`.
-
-```bash
-curl -X POST "$BASE_URL/api/appliances" \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name": "Kitchen refrigerator",
-    "type": "refrigerator",
-    "vendor": "acme",
-    "collectionIntervalSeconds": 60
-  }'
-```
-
-Example response:
-
-```json
-{
-  "id": 1,
-  "name": "Kitchen refrigerator",
-  "type": "refrigerator",
-  "vendor": "acme",
-  "collectionIntervalSeconds": 60,
-  "enabled": true,
-  "lastCollectedAt": null
-}
-```
-
-Register an air conditioner:
-
-```bash
-curl -X POST "$BASE_URL/api/appliances" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"Bedroom AC","type":"air_conditioner","vendor":"northwind","collectionIntervalSeconds":30}'
-```
-
-Supported mocked types are `refrigerator`/`fridge`, `air_conditioner`/`ac`, and any other type. Unknown types receive generic `power` and `status` samples.
-
-### 3. List, modify, or remove appliances
-
-```bash
-curl "$BASE_URL/api/appliances"
-
-curl -X PUT "$BASE_URL/api/appliances/1" \
-  -H 'Content-Type: application/json' \
-  -d '{"name":"Kitchen refrigerator","type":"refrigerator","vendor":"acme","collectionIntervalSeconds":120,"enabled":false}'
-
-curl -X DELETE "$BASE_URL/api/appliances/1"
-```
-
-`PUT` replaces the supplied configuration. Set `enabled` to `false` to stop scheduled and manual collection for an appliance. Deleting an unknown appliance returns `404`.
-
-### 4. Collect metrics immediately
-
-The scheduler checks every five seconds, but an appliance is collected only after its own configured interval elapses. Trigger immediate collection for a reproducible review flow:
-
-```bash
-curl -X POST "$BASE_URL/api/collections/run"
-```
-
-Example response:
-
-```json
-{
-  "appliancesCollected": 2,
-  "metricsStored": 4
-}
-```
-
-Each enabled refrigerator records `temperature` in `C` and `door_open` as `0` or `1` in `boolean`. Each enabled AC records `temperature` in `C` and `power` in `W`.
-
-### 5. Get raw time-bounded metric history
-
-The metric endpoint uses a half-open interval: it includes samples where $start \le collectedAt < end$. This avoids counting a boundary sample twice in adjacent requests.
-
-```bash
-curl --get "$BASE_URL/api/metrics" \
-  --data-urlencode "start=$START" \
-  --data-urlencode "end=$END"
-```
-
-Example response:
-
-```json
-[
-  {
-    "applianceId": 1,
-    "collectedAt": "2026-08-18T16:06:00Z",
-    "metricName": "temperature",
-    "value": 2.4,
-    "unit": "C"
-  }
-]
-```
-
-### 6. Generate a custom-range report
-
-The report endpoint aggregates raw data by appliance, metric name, and unit. Each row exposes the sample count, minimum, maximum, and average.
-
-```bash
-curl --get "$BASE_URL/api/reports" \
-  --data-urlencode "start=$START" \
-  --data-urlencode "end=$END"
-```
-
-Example response fragment:
-
-```json
-{
-  "start": "2026-08-18T16:00:00Z",
-  "end": "2026-08-18T16:10:00Z",
-  "metrics": [
-    {
-      "applianceId": 1,
-      "applianceName": "Kitchen refrigerator",
-      "metricName": "temperature",
-      "unit": "C",
-      "samples": 3,
-      "minimum": 2.1,
-      "maximum": 2.8,
-      "average": 2.5
-    }
-  ]
-}
-```
-
-### 7. Generate a daily report
-
-Daily reports use midnight-to-midnight UTC, not the server's local time zone:
-
-```bash
-curl "$BASE_URL/api/reports/daily/2026-08-18"
-```
-
-## HTTP API Reference
-
-| Method and path | Purpose | Success |
-|---|---|---:|
-| `GET /` | Service name and route discovery. | `200` |
-| `GET /api/appliances` | List configured appliances. | `200` |
-| `POST /api/appliances` | Create an appliance. | `201` |
-| `PUT /api/appliances/{id}` | Replace appliance configuration. | `200` |
-| `DELETE /api/appliances/{id}` | Remove an appliance. | `204` |
-| `POST /api/collections/run` | Force due-interval bypass for enabled appliances. | `200` |
-| `GET /api/metrics?start&end` | Retrieve raw observations in `[start,end)`. | `200` |
-| `GET /api/reports?start&end` | Aggregate observations in `[start,end)`. | `200` |
-| `GET /api/reports/daily/{YYYY-MM-DD}` | Aggregate one UTC calendar day. | `200` |
-
-Invalid fields are rejected by Bean Validation with `400`. An invalid or empty time range returns `400` with `{"error":"start must be before end"}`. Missing appliance IDs return `404` with an error message.
+H2 is deliberately not the production persistence choice. Its in-memory mode loses data when the application stops and does not provide production-grade multi-instance availability, backup strategy, access control, or operational tooling. For production, configure Spring Data JPA with PostgreSQL or another managed relational database, use Flyway or Liquibase migrations, and disable the H2 console.
 
 ## Architecture
 
