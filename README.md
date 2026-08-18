@@ -126,6 +126,10 @@ Mocked metric behavior:
 |---|---|
 | `refrigerator` or `fridge` | `temperature` in `C`, `door_open` as `0` or `1` in `boolean` |
 | `air_conditioner` or `ac` | `temperature` in `C`, `power` in `W` |
+| `television` or `tv` | `power` in `W`, `volume` in `percent` |
+| `oven` | `temperature` in `C`, `door_open` as `0` or `1` in `boolean` |
+| `washer` or `washing_machine` | `cycle_progress` in `percent`, `water_usage` in `L` |
+| `dryer` | `cycle_progress` in `percent`, `humidity` in `percent` |
 | Any other type | `power` in `W`, `status` as `0` or `1` in `boolean` |
 
 ### 3. Manage appliances
