@@ -33,6 +33,42 @@ H2 is an embedded relational Java database. In this service it runs in memory wi
 
 H2 is deliberately not the production persistence choice. Its in-memory mode loses data when the application stops and does not provide production-grade multi-instance availability, backup strategy, access control, or operational tooling. For production, configure Spring Data JPA with PostgreSQL or another managed relational database, use Flyway or Liquibase migrations, and disable the H2 console.
 
+## API Signatures
+
+All routes return JSON except `DELETE /api/appliances/{id}`, which returns an empty response body. Timestamps use ISO-8601 UTC instants, such as `2026-08-18T16:06:00Z`.
+
+### Shared Types
+
+| Type | Signature | Description |
+|---|---|---|
+| `ApplianceRequest` | `{name, type, vendor, collectionIntervalSeconds, enabled?}` | Input for appliance creation or replacement. `name`, `type`, and `vendor` must be non-blank; `collectionIntervalSeconds` must be at least `1`; `enabled` is optional. |
+| `ApplianceResponse` | `{id, name, type, vendor, collectionIntervalSeconds, enabled, lastCollectedAt}` | Persisted appliance configuration. `lastCollectedAt` is `null` before the first successful collection. |
+| `MetricResponse` | `{applianceId, collectedAt, metricName, value, unit}` | One raw, normalized historical observation. |
+| `CollectionResponse` | `{appliancesCollected, metricsStored}` | Number of enabled appliances visited and raw observations persisted by a collection run. |
+| `MetricSummary` | `{applianceId, applianceName, metricName, unit, samples, minimum, maximum, average}` | Aggregate statistics for one appliance metric. |
+| `ReportResponse` | `{start, end, metrics: MetricSummary[]}` | A report's half-open time range and aggregate rows. |
+| `ErrorResponse` | `{error}` | Shared error body returned for application-level `400` and `404` responses. |
+
+### Route Contracts
+
+| Method and path | Request signature | Success response | Error contract |
+|---|---|---|---|
+| `GET /` | No request body. | `200` with a service name and endpoint discovery map. | None. |
+| `GET /api/appliances` | No request body. | `200` with `ApplianceResponse[]`. | None. |
+| `POST /api/appliances` | `ApplianceRequest`. | `201` with `ApplianceResponse`. | `400` for invalid request fields. |
+| `PUT /api/appliances/{id}` | Path `id: long`; `ApplianceRequest`. | `200` with `ApplianceResponse`. | `400` for invalid fields; `404` when `id` is unknown. |
+| `DELETE /api/appliances/{id}` | Path `id: long`. | `204` with no body. | `404` when `id` is unknown. |
+| `POST /api/collections/run` | No request body. | `200` with `CollectionResponse`. | None. Disabled appliances are not collected. |
+| `GET /api/metrics` | Query `start: Instant`, `end: Instant`. | `200` with `MetricResponse[]`. | `400` unless $start < end$. |
+| `GET /api/reports` | Query `start: Instant`, `end: Instant`. | `200` with `ReportResponse`. | `400` unless $start < end$. |
+| `GET /api/reports/daily/{date}` | Path `date: LocalDate` in `YYYY-MM-DD` form. | `200` with `ReportResponse`. | `400` for an invalid date. |
+
+### Time-Range Semantics
+
+The raw metrics and custom report endpoints use a half-open interval: $[start, end)$. A metric is included when $start \le collectedAt < end$. This makes adjacent report windows non-overlapping, avoiding duplicate observations at the shared boundary.
+
+The daily report endpoint translates its date into the UTC range from midnight at the start of the date to midnight at the start of the following date.
+
 ## Architecture
 
 ```mermaid
