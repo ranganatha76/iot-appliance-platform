@@ -5,6 +5,7 @@ import com.example.iot.api.ApiModels.ReportResponse;
 import com.example.iot.domain.MetricObservation;
 import com.example.iot.repository.MetricObservationRepository;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import java.time.Instant;
 import java.util.*;
 
@@ -16,7 +17,7 @@ public class ReportService {
     public ReportService(MetricObservationRepository repository) { this.repository = repository; }
 
     /** Aggregates every metric in a validated half-open date range by appliance and metric. */
-    public ReportResponse generate(Instant start, Instant end) {
+    @Transactional(readOnly = true) public ReportResponse generate(Instant start, Instant end) {
         if (!start.isBefore(end)) throw new IllegalArgumentException("start must be before end");
         Map<String, List<MetricObservation>> groups = new LinkedHashMap<>();
         for (MetricObservation metric : repository.findByCollectedAtGreaterThanEqualAndCollectedAtLessThan(start, end)) groups.computeIfAbsent(metric.getAppliance().getId() + ":" + metric.getMetricName() + ":" + metric.getUnit(), ignored -> new ArrayList<>()).add(metric);

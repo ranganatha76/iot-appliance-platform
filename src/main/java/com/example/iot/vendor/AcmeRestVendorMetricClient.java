@@ -24,7 +24,7 @@ public class AcmeRestVendorMetricClient implements VendorMetricClient {
 
     /** Authenticates, reads an ACME-style REST payload, and maps it to normalized metrics. */
     @Override public List<VendorMetric> fetchMetrics(Appliance appliance, Instant collectedAt) {
-        if (bearerToken.isBlank()) throw new VendorIntegrationException("ACME authentication failed: bearer token is not configured");
+        if (bearerToken.isBlank()) throw new VendorIntegrationException(VendorIntegrationException.FailureType.AUTHENTICATION, "ACME authentication failed: bearer token is not configured");
         Map<String, Double> payload = restPayload(appliance, collectedAt);
         return payload.entrySet().stream().map(metric -> new VendorMetric(metric.getKey().equals("watts") ? "power" : "temperature", metric.getValue(), metric.getKey().equals("watts") ? "W" : "C")).toList();
     }

@@ -18,6 +18,14 @@ flowchart LR
 - Vendor adapters convert vendor-specific data into common `VendorMetric` values.
 - Repositories are Spring Data JPA interfaces. Spring creates their implementations and issues database queries through Hibernate.
 
+## Local and Deployment Configuration
+
+The application starts locally with no required environment variables. [application.yml](src/main/resources/application.yml) defaults to an in-memory H2 database, local simulated vendor credentials, H2 console enabled, and a five-second scheduler delay. Actuator health is available at `GET /actuator/health`.
+
+The same file uses environment placeholders for deployment. Set `DATABASE_URL`, `DATABASE_USERNAME`, `DATABASE_PASSWORD`, `JPA_DDL_AUTO`, `H2_CONSOLE_ENABLED`, `ACME_BEARER_TOKEN`, `NORTHWIND_API_KEY`, and scheduler/vendor-limit settings in the environment. PostgreSQL JDBC support is included in [pom.xml](pom.xml); use `JPA_DDL_AUTO=validate` with versioned migrations and `H2_CONSOLE_ENABLED=false` outside local review.
+
+`spring.jpa.open-in-view=false` prevents HTTP responses from depending on a persistence session that outlives the service call. The historical query explicitly fetches its source appliance, so metric response mapping and report aggregation have the data they need without lazy-loading outside the persistence boundary.
+
 ## 1. Add an Appliance
 
 ### Request
@@ -158,7 +166,9 @@ sequenceDiagram
 | Northwind authentication | First instruction inside Northwind `fetchMetrics` | [`NorthwindGraphQlVendorMetricClient.fetchMetrics`](src/main/java/com/example/iot/vendor/NorthwindGraphQlVendorMetricClient.java#L33-L38) checks `vendors.northwind.api-key`. A blank value throws `VendorIntegrationException` before rate-limit accounting or metric retrieval. |
 | Rate limit | After Northwind authentication and before the payload is produced | Northwind calls [`enforceRateLimit`](src/main/java/com/example/iot/vendor/NorthwindGraphQlVendorMetricClient.java#L42-L45). It resets the counter when the one-minute window expires, increments the current window count, and throws when the configured `max-requests-per-minute` is exceeded. |
 | Reliability simulation | After Northwind authentication and rate-limit validation | [`NorthwindGraphQlVendorMetricClient.fetchMetrics`](src/main/java/com/example/iot/vendor/NorthwindGraphQlVendorMetricClient.java#L35-L36) throws a temporary-availability `VendorIntegrationException` every configured $n$ requests when `fail-every-requests` is greater than zero. |
-| Failure isolation | Around the complete adapter/capability/metric-save block | [`CollectionService.collect`](src/main/java/com/example/iot/service/CollectionService.java#L34-L44) catches the expected runtime failure for only the current appliance, increments `failedCollections`, and continues its loop. The appliance's `lastCollectedAt` is not advanced, so a later scheduled run can retry it. |
+| Failure isolation | Around vendor adapter selection, capability validation, and metric retrieval | [`CollectionService.collect`](src/main/java/com/example/iot/service/CollectionService.java) catches only typed `VendorIntegrationException` failures for the current appliance, increments `failedCollections`, and continues its loop. The appliance's `lastCollectedAt` is not advanced, so a later scheduled run can retry it. |
+
+`VendorIntegrationException` has one of four categories: `AUTHENTICATION`, `CAPABILITY`, `RATE_LIMIT`, or `TEMPORARY_UNAVAILABLE`. The collection warning log includes that category with the appliance ID, vendor, type, and message. Importantly, the collection catch handles only `VendorIntegrationException`: a database write or unexpected internal failure propagates and fails the transaction rather than being silently counted as a vendor failure.
 
 The local simulation values are in [application.yml](src/main/resources/application.yml). They are deliberately non-secret development defaults. In production, the same adapter boundary would retrieve credentials from a secret manager and make real HTTP calls, while preserving the normalized `VendorMetric` output used by persistence and reports.
 
@@ -208,7 +218,7 @@ sequenceDiagram
 1. Spring converts the ISO-8601 query parameters to `Instant` values and invokes [`ApplianceController.metrics`](src/main/java/com/example/iot/api/ApplianceController.java#L42).
 2. The controller calls [`MetricService.findBetween`](src/main/java/com/example/iot/service/MetricService.java#L18).
 3. The service rejects an empty or reversed range with `IllegalArgumentException` unless $start < end$.
-4. The service calls [`MetricObservationRepository.findByCollectedAtGreaterThanEqualAndCollectedAtLessThan`](src/main/java/com/example/iot/repository/MetricObservationRepository.java#L10). Spring Data derives the database query from this method name.
+4. The service calls [`MetricObservationRepository.findByCollectedAtGreaterThanEqualAndCollectedAtLessThan`](src/main/java/com/example/iot/repository/MetricObservationRepository.java#L12). Its JPQL query applies the half-open time range and `join fetch`es the source appliance, so response mapping does not rely on Open Session in View.
 5. The query uses the half-open range $[start, end)$: observations at `start` are included; observations at `end` are excluded.
 6. The controller maps each entity with [`MetricResponse.from`](src/main/java/com/example/iot/api/ApiModels.java#L18) and returns `200 OK` with raw historical observations.
 
@@ -244,7 +254,7 @@ GET /api/reports/daily/2026-08-19
 - Invalid JSON fields or a non-positive interval fail Bean Validation before the controller invokes the service.
 - Unknown appliance updates and deletes call [`ApplianceService.find`](src/main/java/com/example/iot/service/ApplianceService.java#L21), which throws `NoSuchElementException`; [`ApiExceptionHandler`](src/main/java/com/example/iot/api/ApiExceptionHandler.java) maps it to `404`.
 - Empty or reversed metric/report ranges throw `IllegalArgumentException`; `ApiExceptionHandler` maps it to `400`.
-- Vendor failures are deliberately contained inside `CollectionService.collect`; they appear in `failedCollections` rather than failing the entire collection request.
+- Typed vendor failures are deliberately contained inside `CollectionService.collect`; they appear in `failedCollections` rather than failing the entire collection request and are logged with appliance ID, vendor, type, failure category, and message. Persistence and unexpected internal failures are not contained: they propagate so transaction problems remain visible.
 
 ## Where To Start While Reviewing
 

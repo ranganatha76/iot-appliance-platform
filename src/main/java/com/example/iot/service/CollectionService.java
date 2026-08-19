@@ -6,15 +6,19 @@ import com.example.iot.repository.ApplianceRepository;
 import com.example.iot.repository.MetricObservationRepository;
 import com.example.iot.vendor.VendorMetric;
 import com.example.iot.vendor.VendorMetricClient;
+import com.example.iot.vendor.VendorIntegrationException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 
 @Service
 public class CollectionService {
+    private static final Logger LOGGER = LoggerFactory.getLogger(CollectionService.class);
     private final ApplianceRepository appliances;
     private final MetricObservationRepository metrics;
     private final List<VendorMetricClient> vendorMetricClients;
@@ -33,14 +37,15 @@ public class CollectionService {
             if (!appliance.isEnabled() || (!force && !due)) continue;
             try {
                 VendorMetricClient client = clientFor(appliance);
-                if (!client.capabilities().supportsApplianceType(appliance.getType())) throw new IllegalArgumentException("Vendor does not support appliance type: " + appliance.getType());
+                if (!client.capabilities().supportsApplianceType(appliance.getType())) throw new VendorIntegrationException(VendorIntegrationException.FailureType.CAPABILITY, "Vendor does not support appliance type: " + appliance.getType());
                 for (VendorMetric sample : client.fetchMetrics(appliance, now)) {
                     metrics.save(new MetricObservation(appliance, now, sample.name(), sample.value(), sample.unit()));
                     stored++;
                 }
                 appliance.markCollected(now); collected++;
-            } catch (RuntimeException exception) {
+            } catch (VendorIntegrationException exception) {
                 failed++;
+                LOGGER.warn("Vendor metric collection failed for applianceId={}, vendor={}, type={}, failureType={}: {}", appliance.getId(), appliance.getVendor(), appliance.getType(), exception.getFailureType(), exception.getMessage());
             }
         }
         return new CollectionResult(collected, stored, failed);

@@ -45,6 +45,8 @@ mvn spring-boot:run
 
 The API starts at `http://localhost:8080`. Open `http://localhost:8080/` to see a JSON endpoint index. Stop the application with `Ctrl+C`.
 
+Local startup requires no environment variables: the default configuration starts an in-memory H2 database and uses non-secret simulated vendor credentials. Operational health is available at `http://localhost:8080/actuator/health`.
+
 The development H2 console is available at `http://localhost:8080/h2-console`:
 
 | Setting | Value |
@@ -54,6 +56,22 @@ The development H2 console is available at `http://localhost:8080/h2-console`:
 | Password | empty |
 
 The database remains available while the process runs and is reset when the process stops.
+
+### Configuration and Deployment
+
+Every operational setting has a local default and can be overridden with an environment variable:
+
+| Setting | Local default | Production use |
+|---|---|---|
+| `DATABASE_URL` | In-memory H2 | PostgreSQL JDBC URL. |
+| `DATABASE_USERNAME`, `DATABASE_PASSWORD` | `sa`, empty password | Database credentials injected by the deployment platform. |
+| `JPA_DDL_AUTO` | `update` | Use `validate` after applying versioned Flyway or Liquibase migrations. |
+| `H2_CONSOLE_ENABLED` | `true` | Set to `false`. |
+| `ACME_BEARER_TOKEN`, `NORTHWIND_API_KEY` | Non-secret local simulation values | Inject values from a secret manager; do not commit real credentials. |
+| `NORTHWIND_MAX_REQUESTS_PER_MINUTE`, `NORTHWIND_FAIL_EVERY_REQUESTS` | `60`, `0` | Set vendor operating limits; keep failure simulation disabled outside tests. |
+| `COLLECTION_SCHEDULER_DELAY_MS` | `5000` | Tune scheduler polling after considering vendor limits and fleet size. |
+
+The project includes the PostgreSQL JDBC driver. A PostgreSQL deployment also requires a managed database and versioned schema migrations; H2 is only the local-review default.
 
 ## Verify the Complete Workflow
 
@@ -177,7 +195,8 @@ Example response for two enabled appliances:
 ```json
 {
 	"appliancesCollected": 2,
-	"metricsStored": 4
+	"metricsStored": 4,
+	"failedCollections": 0
 }
 ```
 
@@ -263,14 +282,16 @@ curl "$BASE_URL/api/reports/daily/2026-08-18"
 ## Key Design Choices
 
 - **Persistence:** Spring Data JPA stores `Appliance` and `MetricObservation` entities in H2. This is a local-review choice; H2 can be replaced by a production database configuration.
+- **Operational safety:** Database, vendor, and scheduler settings are environment-overridable. Actuator exposes `/actuator/health`; H2 console access is configurable; Open Session in View is disabled; historical range reads fetch required appliance data explicitly; and collection failures are logged with appliance context.
 - **Background job:** Spring scheduling invokes the collection coordinator every five seconds. Each appliance retains its own collection interval, which prevents every device being polled at the same rate.
 - **Vendor integration:** `CollectionService` selects a `VendorMetricClient` by the appliance's vendor. Each adapter owns its authentication, source API style, capabilities, rate-limit behavior, reliability behavior, and conversion to normalized metrics; collection persistence remains vendor-neutral.
+- **Vendor reliability:** Expected vendor failures are typed as authentication, capability, rate-limit, or temporary-availability errors. They are counted and logged per appliance, while database and other internal failures are allowed to fail the transaction instead of being misreported as vendor errors.
 - **Reports:** The service stores raw observations and derives reports at request time, preserving history and allowing any supported date range.
 - **Reviewability:** `POST /api/collections/run` allows immediate data collection instead of waiting for a configured interval.
 
 ## Assumptions and Non-Goals
 
-Tenant isolation, secret-manager integration, production database migrations, durable retry/backoff queues, distributed scheduler locking, pagination, and persistent storage across process restarts are outside this take-home scope. The local `application.yml` contains non-secret simulated vendor credentials and controls for Northwind's per-minute rate limit and deterministic transient failures. Boolean-like vendor state is stored as numeric `0` or `1` so it can be included in the uniform report format.
+Tenant isolation, secret-manager integration, versioned production database migrations, durable retry/backoff queues, distributed scheduler locking, pagination, and persistent storage across process restarts are outside this take-home scope. The application is prepared for these concerns through environment-based configuration, PostgreSQL JDBC support, configurable H2-console exposure, health probes, and explicit JPA fetch behavior. The local `application.yml` contains non-secret simulated vendor credentials and controls for Northwind's per-minute rate limit and deterministic transient failures. Boolean-like vendor state is stored as numeric `0` or `1` so it can be included in the uniform report format.
 
 ### Mock vendor contracts
 

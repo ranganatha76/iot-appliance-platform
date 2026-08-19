@@ -31,9 +31,9 @@ public class NorthwindGraphQlVendorMetricClient implements VendorMetricClient {
 
     /** Authenticates, enforces the vendor limit, simulates reliability, and normalizes GraphQL data. */
     @Override public synchronized List<VendorMetric> fetchMetrics(Appliance appliance, Instant collectedAt) {
-        if (apiKey.isBlank()) throw new VendorIntegrationException("Northwind authentication failed: API key is not configured");
+        if (apiKey.isBlank()) throw new VendorIntegrationException(VendorIntegrationException.FailureType.AUTHENTICATION, "Northwind authentication failed: API key is not configured");
         enforceRateLimit(collectedAt);
-        if (failEveryRequests > 0 && requests.incrementAndGet() % failEveryRequests == 0) throw new VendorIntegrationException("Northwind API temporarily unavailable");
+        if (failEveryRequests > 0 && requests.incrementAndGet() % failEveryRequests == 0) throw new VendorIntegrationException(VendorIntegrationException.FailureType.TEMPORARY_UNAVAILABLE, "Northwind API temporarily unavailable");
         Map<String, Double> payload = graphQlPayload(appliance, collectedAt);
         return payload.entrySet().stream().map(metric -> new VendorMetric(metric.getKey().equals("wattsNow") ? "power" : metric.getKey().equals("completion") ? "cycle_progress" : metric.getKey(), metric.getValue(), metric.getKey().equals("wattsNow") ? "W" : "percent")).toList();
     }
@@ -41,7 +41,7 @@ public class NorthwindGraphQlVendorMetricClient implements VendorMetricClient {
     /** Rejects calls above Northwind's configured rolling one-minute API allowance. */
     private void enforceRateLimit(Instant collectedAt) {
         if (windowStart.plus(1, ChronoUnit.MINUTES).isBefore(collectedAt)) { windowStart = collectedAt; requestsInWindow.set(0); }
-        if (requestsInWindow.incrementAndGet() > maxRequestsPerMinute) throw new VendorIntegrationException("Northwind API rate limit exceeded");
+        if (requestsInWindow.incrementAndGet() > maxRequestsPerMinute) throw new VendorIntegrationException(VendorIntegrationException.FailureType.RATE_LIMIT, "Northwind API rate limit exceeded");
     }
 
     /** Represents a GraphQL response shape whose field names differ from the platform model. */

@@ -1,18 +1,35 @@
 spring:
   datasource:
-    url: jdbc:h2:mem:appliances;DB_CLOSE_DELAY=-1;MODE=PostgreSQL
+    url: ${DATABASE_URL:jdbc:h2:mem:appliances;DB_CLOSE_DELAY=-1;MODE=PostgreSQL}
+    username: ${DATABASE_USERNAME:sa}
+    password: ${DATABASE_PASSWORD:}
   jpa:
+    open-in-view: false
     hibernate:
-      ddl-auto: update
+      ddl-auto: ${JPA_DDL_AUTO:update}
   h2:
     console:
-      enabled: true
+      enabled: ${H2_CONSOLE_ENABLED:true}
 collection:
-  scheduler-delay-ms: 5000
+  scheduler-delay-ms: ${COLLECTION_SCHEDULER_DELAY_MS:5000}
 vendors:
   acme:
-    bearer-token: local-acme-bearer-token
+    bearer-token: ${ACME_BEARER_TOKEN:local-acme-bearer-token}
   northwind:
-    api-key: local-northwind-api-key
-    max-requests-per-minute: 60
-    fail-every-requests: 0
+    api-key: ${NORTHWIND_API_KEY:local-northwind-api-key}
+    max-requests-per-minute: ${NORTHWIND_MAX_REQUESTS_PER_MINUTE:60}
+    fail-every-requests: ${NORTHWIND_FAIL_EVERY_REQUESTS:0}
+management:
+  endpoint:
+    health:
+      probes:
+        enabled: true
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  health:
+    livenessstate:
+      enabled: true
+    readinessstate:
+      enabled: true

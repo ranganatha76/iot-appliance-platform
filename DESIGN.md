@@ -21,7 +21,7 @@ The scenario requires a consistent platform API even when appliance vendors expo
 | Capabilities | Every adapter returns `VendorCapabilities`: supported appliance types plus normalized metric names. Collection marks an appliance collection as failed rather than persisting data when the selected vendor does not support its appliance type. |
 | Different metric names | ACME maps `temp_celsius` and `watts` to `temperature` and `power`; Northwind maps `completion` and `wattsNow` to `cycle_progress` and `power`. Persisted history and reports use only the normalized names and units. |
 | Rate limits | Northwind's adapter maintains a rolling one-minute request count and rejects requests above `vendors.northwind.max-requests-per-minute`. |
-| Reliability | Northwind can be configured to raise a deterministic temporary availability failure every $n$ requests. Collection isolates a failed appliance: other appliances continue collecting in the same run. |
+| Reliability | Northwind can be configured to raise a deterministic temporary availability failure every $n$ requests. Collection isolates typed vendor failures for one appliance so others continue collecting; persistence and unexpected internal faults propagate and fail the transaction. |
 | Consistent client behavior | Regardless of vendor, successful samples become `MetricObservation` records and are returned through the same raw-history, daily-report, and custom-range-report APIs. `CollectionResponse` reports successful appliances, stored samples, and failed collections. |
 
 ### Local Vendor Contract Matrix
@@ -56,6 +56,22 @@ H2 is an embedded relational Java database. In this service it runs in memory wi
 ### Tradeoffs and production path
 
 H2 is deliberately not the production persistence choice. Its in-memory mode loses data when the application stops and does not provide production-grade multi-instance availability, backup strategy, access control, or operational tooling. For production, configure Spring Data JPA with PostgreSQL or another managed relational database, use Flyway or Liquibase migrations, and disable the H2 console.
+
+## Operational Readiness
+
+The application keeps local execution friction low while moving operational concerns into environment-overridable configuration. Its default values start H2 with deterministic vendor simulations; a deployment can override database, credential, scheduler, and vendor-control values without code changes.
+
+| Concern | Local behavior | Deployment behavior |
+|---|---|---|
+| Database | `DATABASE_URL` defaults to H2 in memory. | Set `DATABASE_URL`, `DATABASE_USERNAME`, and `DATABASE_PASSWORD` for PostgreSQL. The PostgreSQL JDBC driver is included at runtime. |
+| Schema management | `JPA_DDL_AUTO` defaults to `update` for local review. | Set it to `validate` and apply versioned Flyway or Liquibase migrations before starting the application. |
+| H2 console | `H2_CONSOLE_ENABLED` defaults to `true`. | Set it to `false`; do not expose a database console in production. |
+| Vendor credentials | Environment values default to non-secret simulation strings. | Supply `ACME_BEARER_TOKEN` and `NORTHWIND_API_KEY` through a secret manager or deployment secret mechanism. |
+| Collection operations | The scheduler delay and Northwind limits have local defaults. | Tune `COLLECTION_SCHEDULER_DELAY_MS` and the Northwind settings to the appliance fleet and actual vendor policy. |
+| Health | Spring Boot Actuator exposes `/actuator/health`, including liveness and readiness probes. | Restrict actuator exposure at the network boundary and use the health endpoint for platform probes. |
+| Collection failure visibility | A typed vendor failure increments `failedCollections`. | `CollectionService` writes a warning containing appliance ID, vendor, type, failure category, and message. It does not swallow persistence or unexpected internal failures, protecting transaction integrity. |
+
+`spring.jpa.open-in-view` is disabled. The service therefore does not depend on an HTTP request retaining a JPA session: the historical range repository query explicitly joins and fetches the source `Appliance`, and report generation runs in a read-only transaction.
 
 ## API Signatures
 
@@ -158,8 +174,8 @@ This walkthrough explains every handwritten source element. Java record componen
 ### Bootstrap and configuration
 
 - `AppliancePlatformApplication.java`: `@SpringBootApplication` enables component discovery, auto-configuration, and application startup. `@EnableScheduling` activates `@Scheduled` collection. `main` passes the application class and process arguments to `SpringApplication.run`.
-- `application.yml`: selects in-memory H2, asks Hibernate to derive tables from the two entities, enables the development-only H2 console, sets the scheduler's five-second check interval, and provides non-secret local settings for the ACME bearer token plus Northwind API key, rate limit, and failure simulation.
-- `pom.xml`: declares Java 21; web, validation, JPA, and test Spring Boot starters; H2 at runtime; and the Spring Boot Maven plugin for `mvn spring-boot:run` and packaging.
+- `application.yml`: supplies local H2 defaults while allowing database, schema, H2-console, scheduler, and vendor settings to be overridden by environment variables. It also configures Actuator health, liveness, and readiness probes.
+- `pom.xml`: declares Java 21; web, validation, JPA, Actuator, and test Spring Boot starters; H2 and PostgreSQL drivers at runtime; and the Spring Boot Maven plugin for `mvn spring-boot:run` and packaging.
 
 ### API layer
 
@@ -172,14 +188,14 @@ This walkthrough explains every handwritten source element. Java record componen
 - `Appliance.java`: is the JPA appliance table. Its no-argument constructor permits Hibernate hydration. Its public constructor initializes a new managed appliance. Getters expose persistent state. `update` replaces mutable configuration. `markCollected` updates the timestamp after observations are saved.
 - `MetricObservation.java`: is the JPA history table. It stores one metric sample tied to its appliance. The protected constructor serves Hibernate; the public constructor sets every required value; getters make its fields available to API mapping and reporting.
 - `ApplianceRepository.java`: inherits standard JPA create, read, update, and delete operations for `Appliance` from `JpaRepository`.
-- `MetricObservationRepository.java`: inherits standard JPA operations and declares `findByCollectedAtGreaterThanEqualAndCollectedAtLessThan`. Spring Data derives SQL from that name, returning the half-open timestamp range.
+- `MetricObservationRepository.java`: inherits standard JPA operations and declares `findByCollectedAtGreaterThanEqualAndCollectedAtLessThan`. Its JPQL query applies the half-open timestamp range and `join fetch`es the source appliance, avoiding lazy-loading failures after the repository call. `MetricObservation` adds an index on `collectedAt` for range reads.
 
 ### Application services
 
 - `ApplianceService.java`: owns appliance lifecycle rules. `findAll` reads every appliance. `find` reads one or throws `NoSuchElementException` for the exception advice. `create` transforms the API request into an entity. `update` loads then modifies an existing entity; an omitted enabled value means true. `delete` confirms existence before removal.
 - `MetricService.java`: owns raw historical reads. `findBetween` validates the range before executing the repository query. `@Transactional(readOnly = true)` documents that it does not mutate data and permits database optimizations.
-- `CollectionService.java`: owns scheduling and persistence orchestration, not vendor implementation. `collectDueAppliances` is called by Spring at the configured fixed delay. `collect` checks enabled state and either due interval or force flag, selects the matching vendor client, validates its capabilities, stores normalized observations, advances `lastCollectedAt` after a successful collection, and returns successful, stored, and failed counts. Expected vendor failures are isolated per appliance so the rest of the run can continue.
-- `ReportService.java`: owns aggregation. `generate` rejects invalid ranges, loads historical samples, groups by appliance ID plus metric and unit, then builds one summary per group. `summarize` calculates count, min, max, and average with `DoubleSummaryStatistics`.
+- `CollectionService.java`: owns scheduling and persistence orchestration, not vendor implementation. `collectDueAppliances` is called by Spring at the configured fixed delay. `collect` checks enabled state and either due interval or force flag, selects the matching vendor client, validates its capabilities, stores normalized observations, advances `lastCollectedAt` after a successful collection, and returns successful, stored, and failed counts. It isolates only typed `VendorIntegrationException` categories (`AUTHENTICATION`, `CAPABILITY`, `RATE_LIMIT`, and `TEMPORARY_UNAVAILABLE`) per appliance and logs each one with context. Persistence and other unexpected failures propagate, preventing a corrupted transaction from being reported as a vendor failure.
+- `ReportService.java`: owns aggregation. `generate` is read-only transactional, rejects invalid ranges, loads historical samples, groups by appliance ID plus metric and unit, then builds one summary per group. `summarize` calculates count, min, max, and average with `DoubleSummaryStatistics`.
 
 ### Vendor extension point
 
@@ -189,7 +205,7 @@ This walkthrough explains every handwritten source element. Java record componen
 - `AcmeRestVendorMetricClient.java`: simulates ACME's bearer-authenticated REST payload, then maps `temp_celsius` and `watts` to the platform's `temperature` and `power` names.
 - `NorthwindGraphQlVendorMetricClient.java`: simulates Northwind's API-key-authenticated GraphQL payload, normalizes `completion` and `wattsNow`, enforces a configurable per-minute allowance, and can produce deterministic transient availability errors.
 - `MockVendorMetricClient.java`: supplies a credential-free generic fallback for vendor names other than ACME and Northwind, making unintegrated vendors locally reviewable.
-- `VendorIntegrationException.java`: identifies expected vendor authentication, rate-limit, and temporary availability failures.
+- `VendorIntegrationException.java`: identifies and classifies expected vendor authentication, capability, rate-limit, and temporary-availability failures so collection can isolate them without suppressing persistence faults.
 
 ### Tests
 
