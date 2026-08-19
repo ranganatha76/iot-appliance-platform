@@ -19,7 +19,7 @@ public final class ApiModels {
         /** Maps one persisted metric sample to its public API representation. */
         public static MetricResponse from(MetricObservation metric) { return new MetricResponse(metric.getAppliance().getId(), metric.getCollectedAt(), metric.getMetricName(), metric.getMetricValue(), metric.getUnit()); }
     }
-    public record CollectionResponse(int appliancesCollected, int metricsStored) { }
+    public record CollectionResponse(int appliancesCollected, int metricsStored, int failedCollections) { }
     public record MetricSummary(Long applianceId, String applianceName, String metricName, String unit, long samples, double minimum, double maximum, double average) { }
     public record ReportResponse(Instant start, Instant end, List<MetricSummary> metrics) { }
 }

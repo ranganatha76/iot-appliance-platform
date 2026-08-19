@@ -255,7 +255,7 @@ curl "$BASE_URL/api/reports/daily/2026-08-18"
 | `POST /api/appliances` | appliance JSON | Registers an appliance. | `201` |
 | `PUT /api/appliances/{id}` | appliance JSON | Replaces configuration. | `200` |
 | `DELETE /api/appliances/{id}` | none | Deletes an appliance. | `204` |
-| `POST /api/collections/run` | none | Immediately collects enabled appliances. | `200` |
+| `POST /api/collections/run` | none | Immediately collects enabled appliances; response includes successful, stored, and failed collection counts. | `200` |
 | `GET /api/metrics?start&end` | ISO-8601 timestamps | Retrieves raw history. | `200` |
 | `GET /api/reports?start&end` | ISO-8601 timestamps | Produces custom-range aggregates. | `200` |
 | `GET /api/reports/daily/{date}` | UTC date | Produces one daily aggregate. | `200` |
@@ -264,13 +264,21 @@ curl "$BASE_URL/api/reports/daily/2026-08-18"
 
 - **Persistence:** Spring Data JPA stores `Appliance` and `MetricObservation` entities in H2. This is a local-review choice; H2 can be replaced by a production database configuration.
 - **Background job:** Spring scheduling invokes the collection coordinator every five seconds. Each appliance retains its own collection interval, which prevents every device being polled at the same rate.
-- **Vendor integration:** `VendorMetricClient` is an interface; `MockVendorMetricClient` is the local implementation. Add real vendor clients behind this interface without changing collection logic.
+- **Vendor integration:** `CollectionService` selects a `VendorMetricClient` by the appliance's vendor. Each adapter owns its authentication, source API style, capabilities, rate-limit behavior, reliability behavior, and conversion to normalized metrics; collection persistence remains vendor-neutral.
 - **Reports:** The service stores raw observations and derives reports at request time, preserving history and allowing any supported date range.
 - **Reviewability:** `POST /api/collections/run` allows immediate data collection instead of waiting for a configured interval.
 
 ## Assumptions and Non-Goals
 
-Authentication, tenant isolation, vendor credentials, production database migrations, retry/backoff queues, distributed scheduler locking, pagination, and persistent storage across process restarts are outside this take-home scope. Boolean-like vendor state is stored as numeric `0` or `1` so it can be included in the uniform report format.
+Tenant isolation, secret-manager integration, production database migrations, durable retry/backoff queues, distributed scheduler locking, pagination, and persistent storage across process restarts are outside this take-home scope. The local `application.yml` contains non-secret simulated vendor credentials and controls for Northwind's per-minute rate limit and deterministic transient failures. Boolean-like vendor state is stored as numeric `0` or `1` so it can be included in the uniform report format.
+
+### Mock vendor contracts
+
+| Vendor | Simulated API style and authentication | Capabilities | Reliability and rate limit |
+|---|---|---|---|
+| `acme` | REST payload with bearer-token authentication | Refrigerators and air conditioners; normalized `temperature` and `power` | Authentication failure when the local token is blank. |
+| `northwind` | GraphQL payload with API-key authentication | Washers, dryers, televisions; normalized `cycle_progress` and `power` | Configurable per-minute request limit and optional deterministic temporary failures. |
+| Other vendor name | Generic local mock, no credential | Any documented appliance type | No simulated transport failure or rate limit. |
 
 ## Further Documentation
 

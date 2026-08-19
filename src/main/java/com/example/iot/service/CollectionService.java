@@ -11,33 +11,43 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.List;
 
 @Service
 public class CollectionService {
     private final ApplianceRepository appliances;
     private final MetricObservationRepository metrics;
-    private final VendorMetricClient vendorMetricClient;
+    private final List<VendorMetricClient> vendorMetricClients;
 
     /** Creates the collection coordinator with appliance and historical-metric storage. */
-    public CollectionService(ApplianceRepository appliances, MetricObservationRepository metrics, VendorMetricClient vendorMetricClient) { this.appliances = appliances; this.metrics = metrics; this.vendorMetricClient = vendorMetricClient; }
+    public CollectionService(ApplianceRepository appliances, MetricObservationRepository metrics, List<VendorMetricClient> vendorMetricClients) { this.appliances = appliances; this.metrics = metrics; this.vendorMetricClients = vendorMetricClients; }
 
     /** Collects only enabled appliances whose configured polling interval has elapsed. */
     @Scheduled(fixedDelayString = "${collection.scheduler-delay-ms:5000}") public void collectDueAppliances() { collect(false); }
 
     /** Collects vendor samples and persists them; forcing bypasses only the interval check. */
     @Transactional public CollectionResult collect(boolean force) {
-        Instant now = Instant.now(); int collected = 0; int stored = 0;
+        Instant now = Instant.now(); int collected = 0; int stored = 0; int failed = 0;
         for (Appliance appliance : appliances.findAll()) {
             boolean due = appliance.getLastCollectedAt() == null || Duration.between(appliance.getLastCollectedAt(), now).getSeconds() >= appliance.getCollectionIntervalSeconds();
             if (!appliance.isEnabled() || (!force && !due)) continue;
-            for (VendorMetric sample : vendorMetricClient.fetchMetrics(appliance, now)) {
-                metrics.save(new MetricObservation(appliance, now, sample.name(), sample.value(), sample.unit()));
-                stored++;
+            try {
+                VendorMetricClient client = clientFor(appliance);
+                if (!client.capabilities().supportsApplianceType(appliance.getType())) throw new IllegalArgumentException("Vendor does not support appliance type: " + appliance.getType());
+                for (VendorMetric sample : client.fetchMetrics(appliance, now)) {
+                    metrics.save(new MetricObservation(appliance, now, sample.name(), sample.value(), sample.unit()));
+                    stored++;
+                }
+                appliance.markCollected(now); collected++;
+            } catch (RuntimeException exception) {
+                failed++;
             }
-            appliance.markCollected(now); collected++;
         }
-        return new CollectionResult(collected, stored);
+        return new CollectionResult(collected, stored, failed);
     }
 
-    public record CollectionResult(int appliancesCollected, int metricsStored) { }
+    /** Finds the registered adapter for one appliance vendor. */
+    private VendorMetricClient clientFor(Appliance appliance) { return vendorMetricClients.stream().filter(client -> client.supports(appliance.getVendor())).findFirst().orElseThrow(() -> new IllegalArgumentException("Unsupported vendor: " + appliance.getVendor())); }
+
+    public record CollectionResult(int appliancesCollected, int metricsStored, int failedCollections) { }
 }

@@ -36,7 +36,7 @@ public class ApplianceController {
     @DeleteMapping("/api/appliances/{id}") @ResponseStatus(HttpStatus.NO_CONTENT) public void delete(@PathVariable long id) { appliances.delete(id); }
 
     /** Immediately collects metrics from every enabled appliance for review or recovery. */
-    @PostMapping("/api/collections/run") public CollectionResponse collect() { var result = collection.collect(true); return new CollectionResponse(result.appliancesCollected(), result.metricsStored()); }
+    @PostMapping("/api/collections/run") public CollectionResponse collect() { var result = collection.collect(true); return new CollectionResponse(result.appliancesCollected(), result.metricsStored(), result.failedCollections()); }
 
     /** Returns raw historical samples in the requested half-open time range. */
     @GetMapping("/api/metrics") public List<MetricResponse> metrics(@RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant start, @RequestParam @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant end) { return metrics.findBetween(start, end).stream().map(MetricResponse::from).toList(); }

@@ -9,3 +9,10 @@ spring:
       enabled: true
 collection:
   scheduler-delay-ms: 5000
+vendors:
+  acme:
+    bearer-token: local-acme-bearer-token
+  northwind:
+    api-key: local-northwind-api-key
+    max-requests-per-minute: 60
+    fail-every-requests: 0

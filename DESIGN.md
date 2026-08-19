@@ -8,6 +8,30 @@ The project intentionally uses a local H2 database and deterministic mocked vend
 
 All installation, startup, testing, API usage, and end-to-end `curl` examples are in [README.md](README.md). This document explains the technical decisions, internal design, and code structure.
 
+## Scenario Coverage
+
+The scenario requires a consistent platform API even when appliance vendors expose incompatible API styles, credentials, device capabilities, metric names, rate limits, and reliability characteristics. The implementation models those differences at the vendor adapter boundary and exposes one appliance-management, collection, historical-data, and reporting API to clients.
+
+| Scenario concern | Implemented behavior |
+|---|---|
+| Multiple connected appliances | `Appliance` stores a client-provided name, type, vendor, enabled state, and collection interval. The API supports registration, listing, replacement, and deletion. Built-in local profiles cover refrigerators, air conditioners, televisions, ovens, washers, dryers, and a generic fallback. |
+| Different vendors | `CollectionService` receives all Spring `VendorMetricClient` adapters and selects the adapter whose `supports(vendor)` method matches the appliance's registered vendor. |
+| Different API styles | `AcmeRestVendorMetricClient` simulates a REST response; `NorthwindGraphQlVendorMetricClient` simulates a GraphQL response. Both normalize their source payloads before returning platform metrics. |
+| Authentication | ACME validates a configured bearer token. Northwind validates a configured API key. The local configuration values are deliberately non-secret simulation values; production credentials belong in a secret manager. |
+| Capabilities | Every adapter returns `VendorCapabilities`: supported appliance types plus normalized metric names. Collection marks an appliance collection as failed rather than persisting data when the selected vendor does not support its appliance type. |
+| Different metric names | ACME maps `temp_celsius` and `watts` to `temperature` and `power`; Northwind maps `completion` and `wattsNow` to `cycle_progress` and `power`. Persisted history and reports use only the normalized names and units. |
+| Rate limits | Northwind's adapter maintains a rolling one-minute request count and rejects requests above `vendors.northwind.max-requests-per-minute`. |
+| Reliability | Northwind can be configured to raise a deterministic temporary availability failure every $n$ requests. Collection isolates a failed appliance: other appliances continue collecting in the same run. |
+| Consistent client behavior | Regardless of vendor, successful samples become `MetricObservation` records and are returned through the same raw-history, daily-report, and custom-range-report APIs. `CollectionResponse` reports successful appliances, stored samples, and failed collections. |
+
+### Local Vendor Contract Matrix
+
+| Vendor | Simulated source contract | Authentication | Supported appliance types | Source-to-platform metric normalization | Operational behavior |
+|---|---|---|---|---|---|
+| `acme` | REST-style JSON map | Bearer token | `refrigerator`, `fridge`, `air_conditioner`, `ac` | `temp_celsius` -> `temperature`; `watts` -> `power` | A blank token causes an authentication failure. |
+| `northwind` | GraphQL-style result map | API key | `washer`, `washing_machine`, `dryer`, `television`, `tv` | `completion` -> `cycle_progress`; `wattsNow` -> `power` | Configurable one-minute request limit and optional deterministic temporary failures. |
+| Any other vendor name | Generic local mock | None | Any local appliance type | Emits the platform metric names directly | Used to keep unintegrated vendors reviewable without external infrastructure. |
+
 ## Why H2 Database
 
 H2 is an embedded relational Java database. In this service it runs in memory within the Spring Boot process through the JDBC URL `jdbc:h2:mem:appliances`.
@@ -44,7 +68,7 @@ All routes return JSON except `DELETE /api/appliances/{id}`, which returns an em
 | `ApplianceRequest` | `{name, type, vendor, collectionIntervalSeconds, enabled?}` | Input for appliance creation or replacement. `name`, `type`, and `vendor` must be non-blank; `collectionIntervalSeconds` must be at least `1`; `enabled` is optional. |
 | `ApplianceResponse` | `{id, name, type, vendor, collectionIntervalSeconds, enabled, lastCollectedAt}` | Persisted appliance configuration. `lastCollectedAt` is `null` before the first successful collection. |
 | `MetricResponse` | `{applianceId, collectedAt, metricName, value, unit}` | One raw, normalized historical observation. |
-| `CollectionResponse` | `{appliancesCollected, metricsStored}` | Number of enabled appliances visited and raw observations persisted by a collection run. |
+| `CollectionResponse` | `{appliancesCollected, metricsStored, failedCollections}` | Successful appliance collections, raw observations persisted, and vendor collections that failed because of authentication, unsupported capability, rate limit, or temporary availability. |
 | `MetricSummary` | `{applianceId, applianceName, metricName, unit, samples, minimum, maximum, average}` | Aggregate statistics for one appliance metric. |
 | `ReportResponse` | `{start, end, metrics: MetricSummary[]}` | A report's half-open time range and aggregate rows. |
 | `ErrorResponse` | `{error}` | Shared error body returned for application-level `400` and `404` responses. |
@@ -78,8 +102,10 @@ flowchart LR
     Controller --> CollectionService
     Controller --> MetricService
     Controller --> ReportService
-    CollectionService --> VendorClient[VendorMetricClient]
-    VendorClient --> MockClient[MockVendorMetricClient]
+    CollectionService --> VendorClient[VendorMetricClient adapters]
+    VendorClient --> Acme[ACME REST bearer adapter]
+    VendorClient --> Northwind[Northwind GraphQL API-key adapter]
+    VendorClient --> MockClient[Generic mock adapter]
     ApplianceService --> ApplianceRepo[ApplianceRepository]
     CollectionService --> ApplianceRepo
     CollectionService --> MetricRepo[MetricObservationRepository]
@@ -99,7 +125,7 @@ sequenceDiagram
     participant DB as H2
     Scheduler->>Collector: collect(force)
     Collector->>DB: read appliances
-    Collector->>Vendor: fetchMetrics(appliance, now)
+    Collector->>Vendor: select adapter by vendor, validate capabilities, fetchMetrics
     Vendor-->>Collector: normalized metrics
     Collector->>DB: save observations and lastCollectedAt
 ```
@@ -132,7 +158,7 @@ This walkthrough explains every handwritten source element. Java record componen
 ### Bootstrap and configuration
 
 - `AppliancePlatformApplication.java`: `@SpringBootApplication` enables component discovery, auto-configuration, and application startup. `@EnableScheduling` activates `@Scheduled` collection. `main` passes the application class and process arguments to `SpringApplication.run`.
-- `application.yml`: selects in-memory H2, asks Hibernate to derive tables from the two entities, enables the development-only H2 console, and sets the scheduler's five-second check interval.
+- `application.yml`: selects in-memory H2, asks Hibernate to derive tables from the two entities, enables the development-only H2 console, sets the scheduler's five-second check interval, and provides non-secret local settings for the ACME bearer token plus Northwind API key, rate limit, and failure simulation.
 - `pom.xml`: declares Java 21; web, validation, JPA, and test Spring Boot starters; H2 at runtime; and the Spring Boot Maven plugin for `mvn spring-boot:run` and packaging.
 
 ### API layer
@@ -152,34 +178,40 @@ This walkthrough explains every handwritten source element. Java record componen
 
 - `ApplianceService.java`: owns appliance lifecycle rules. `findAll` reads every appliance. `find` reads one or throws `NoSuchElementException` for the exception advice. `create` transforms the API request into an entity. `update` loads then modifies an existing entity; an omitted enabled value means true. `delete` confirms existence before removal.
 - `MetricService.java`: owns raw historical reads. `findBetween` validates the range before executing the repository query. `@Transactional(readOnly = true)` documents that it does not mutate data and permits database optimizations.
-- `CollectionService.java`: owns scheduling and persistence orchestration, not vendor implementation. `collectDueAppliances` is called by Spring at the configured fixed delay. `collect` checks enabled state and either due interval or force flag, asks the client interface for metrics, stores every observation, advances `lastCollectedAt`, and returns counts. It is transactional so one collection execution succeeds or rolls back together.
+- `CollectionService.java`: owns scheduling and persistence orchestration, not vendor implementation. `collectDueAppliances` is called by Spring at the configured fixed delay. `collect` checks enabled state and either due interval or force flag, selects the matching vendor client, validates its capabilities, stores normalized observations, advances `lastCollectedAt` after a successful collection, and returns successful, stored, and failed counts. Expected vendor failures are isolated per appliance so the rest of the run can continue.
 - `ReportService.java`: owns aggregation. `generate` rejects invalid ranges, loads historical samples, groups by appliance ID plus metric and unit, then builds one summary per group. `summarize` calculates count, min, max, and average with `DoubleSummaryStatistics`.
 
 ### Vendor extension point
 
 - `VendorMetric.java`: is a normalized value object with `name`, numeric `value`, and `unit`.
-- `VendorMetricClient.java`: is the abstraction used by collection. A real vendor implementation can authenticate, apply rate limits, map vendor field names, and return `VendorMetric` values without changing `CollectionService`.
-- `MockVendorMetricClient.java`: is the current Spring component implementation. `fetchMetrics` derives a repeatable small variation from appliance ID and timestamp and returns metrics selected by appliance type. It makes the entire review workflow locally testable.
+- `VendorMetricClient.java`: is the abstraction used by collection. Each adapter declares vendor selection and `VendorCapabilities`, then returns normalized `VendorMetric` values.
+- `VendorCapabilities.java`: declares the appliance types and normalized metrics supported by an adapter. Collection rejects unsupported vendor/type combinations before persisting samples.
+- `AcmeRestVendorMetricClient.java`: simulates ACME's bearer-authenticated REST payload, then maps `temp_celsius` and `watts` to the platform's `temperature` and `power` names.
+- `NorthwindGraphQlVendorMetricClient.java`: simulates Northwind's API-key-authenticated GraphQL payload, normalizes `completion` and `wattsNow`, enforces a configurable per-minute allowance, and can produce deterministic transient availability errors.
+- `MockVendorMetricClient.java`: supplies a credential-free generic fallback for vendor names other than ACME and Northwind, making unintegrated vendors locally reviewable.
+- `VendorIntegrationException.java`: identifies expected vendor authentication, rate-limit, and temporary availability failures.
 
 ### Tests
 
 - `ApplianceWorkflowIntegrationTest.java`: starts a real Spring application context and injects `MockMvc`. `rootReturnsApiDiscovery` checks browser discovery. `applianceCanBeRegisteredCollectedAndReported` verifies registration, forced collection, persistence, and aggregation. `invalidRequestsReturnClientErrors` verifies the `404` and `400` contract.
+- `MockVendorMetricClientTest.java`: verifies the type-specific local mock profiles for television, oven, washer, and dryer.
+- `VendorIntegrationClientTest.java`: verifies ACME bearer authentication and REST field normalization, plus Northwind API-key handling, capability declaration, GraphQL field normalization, rate limiting, and temporary availability failures.
 
 ## SOLID Review and Changes
 
 | Principle | Assessment | Result |
 |---|---|---|
-| Single responsibility | Controller, lifecycle, query, collection, reporting, and vendor behavior now have distinct owners. | Fixed: vendor behavior moved from `CollectionService` into `MockVendorMetricClient`; metric reads moved from controller into `MetricService`. |
+| Single responsibility | Controller, lifecycle, query, collection, reporting, and vendor behavior now have distinct owners. | Fixed: vendor behavior moved from `CollectionService` into vendor-specific `VendorMetricClient` adapters; metric reads moved from controller into `MetricService`. |
 | Open/closed | Collection should accept new vendor integrations without source changes. | Fixed: add a `VendorMetricClient` implementation rather than editing orchestration. |
 | Liskov substitution | Any client implementing `VendorMetricClient` can replace the mock client while returning the declared normalized metric type. | Satisfied. |
-| Interface segregation | The vendor boundary asks only for `fetchMetrics`; callers do not depend on authentication or transport operations they do not need. | Satisfied. |
+| Interface segregation | The vendor boundary asks only for vendor selection, declared capabilities, and normalized metric retrieval; callers do not depend on authentication or transport-specific operations. | Satisfied. |
 | Dependency inversion | High-level collection depends on `VendorMetricClient`, not `MockVendorMetricClient`; HTTP handlers depend on services, not JPA repositories. | Fixed. |
 
 Also fixed during review: missing appliance IDs now return `404`, invalid date ranges return `400`, and integration coverage asserts both behaviors.
 
 ## Assumptions and Production Next Steps
 
-The assignment deliberately omits authentication, tenant isolation, persistent production database configuration, vendor credential storage, retries, backoff, rate limiting, distributed scheduling locks, pagination, and observability. In production, implement a separate `VendorMetricClient` for each vendor, select it by the appliance vendor field, use a durable database and migration tool, secure or remove the H2 console, and add authentication plus structured logging and metrics.
+The assignment deliberately uses simulated vendor credentials, rate limits, and temporary failures instead of live integrations. It also omits tenant isolation, persistent production database configuration, secret-manager integration, durable retries and backoff, distributed scheduling locks, pagination, and observability. In production, replace each simulated adapter with a vendor-specific HTTP client, keep credentials in a secret manager, implement bounded retries and backoff for transient vendor errors, use a durable database and migration tool, secure or remove the H2 console, and add authentication plus structured logging and metrics.
 
 ## AI Usage
 

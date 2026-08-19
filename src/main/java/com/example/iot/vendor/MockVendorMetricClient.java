@@ -4,10 +4,17 @@ import com.example.iot.domain.Appliance;
 import org.springframework.stereotype.Component;
 import java.time.Instant;
 import java.util.List;
+import java.util.Set;
 
 /** Provides deterministic metrics in place of real vendor API integrations. */
 @Component
 public class MockVendorMetricClient implements VendorMetricClient {
+    /** Handles unrecognized vendors with generic deterministic metrics for local review. */
+    @Override public boolean supports(String vendor) { return !"acme".equalsIgnoreCase(vendor) && !"northwind".equalsIgnoreCase(vendor); }
+
+    /** Declares generic support for appliance types not owned by a named vendor adapter. */
+    @Override public VendorCapabilities capabilities() { return new VendorCapabilities(Set.of("*"), Set.of("power", "status", "temperature", "door_open", "volume", "cycle_progress", "water_usage", "humidity")); }
+
     /** Returns appliance-type-specific mock metrics with a small deterministic variation. */
     @Override public List<VendorMetric> fetchMetrics(Appliance appliance, Instant collectedAt) {
         double variation = Math.abs((appliance.getId() * 31 + collectedAt.getEpochSecond()) % 10);
