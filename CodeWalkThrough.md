@@ -117,6 +117,51 @@ sequenceDiagram
 10. A vendor authentication, capability, rate-limit, or temporary-availability error is caught per appliance at [CollectionService.java](src/main/java/com/example/iot/service/CollectionService.java#L42-L44). The service increments `failedCollections` and continues to the next appliance.
 11. Manual collection returns [`CollectionResponse`](src/main/java/com/example/iot/api/ApiModels.java#L20) with `appliancesCollected`, `metricsStored`, and `failedCollections`.
 
+### Vendor Authentication, Capabilities, Rate Limits, and Reliability
+
+These checks happen **inside a collection call**, after `CollectionService` selects an adapter for an enabled appliance and before any `MetricObservation` is persisted. They model authentication with the appliance vendor, not authentication of the platform API caller.
+
+```mermaid
+sequenceDiagram
+    participant Collector as CollectionService
+    participant Adapter as Selected vendor adapter
+    participant Vendor as Simulated vendor API
+    participant DB as H2
+
+    Collector->>Adapter: supports(appliance.vendor)
+    Adapter-->>Collector: matching adapter
+    Collector->>Adapter: capabilities().supportsApplianceType(type)
+    alt Unsupported type
+        Adapter-->>Collector: false
+        Collector->>Collector: failedCollections++
+    else Supported type
+        Collector->>Adapter: fetchMetrics(appliance, now)
+        Adapter->>Adapter: validate vendor credential
+        Adapter->>Adapter: apply vendor limits/reliability rules
+        alt Authentication, rate-limit, or availability failure
+            Adapter-->>Collector: VendorIntegrationException
+            Collector->>Collector: failedCollections++
+        else Vendor call succeeds
+            Adapter->>Vendor: read REST or GraphQL payload
+            Vendor-->>Adapter: vendor-specific fields
+            Adapter-->>Collector: normalized VendorMetric[]
+            Collector->>DB: persist MetricObservation rows
+        end
+    end
+```
+
+| Concern | When it runs | Code and outcome |
+|---|---|---|
+| Adapter selection | Before metric retrieval for every appliance | [`CollectionService.clientFor`](src/main/java/com/example/iot/service/CollectionService.java#L50) filters injected adapters by `supports(appliance.getVendor())`. `acme` chooses the ACME adapter; `northwind` chooses Northwind; all other vendor names use the generic mock. |
+| Capabilities | After adapter selection and before `fetchMetrics` | [`CollectionService.collect`](src/main/java/com/example/iot/service/CollectionService.java#L35-L36) asks `VendorCapabilities.supportsApplianceType`. ACME permits refrigerators and air conditioners; Northwind permits washers, dryers, and televisions. A false result throws `IllegalArgumentException`, increments `failedCollections`, and writes no metrics. |
+| ACME authentication | First instruction inside ACME `fetchMetrics` | [`AcmeRestVendorMetricClient.fetchMetrics`](src/main/java/com/example/iot/vendor/AcmeRestVendorMetricClient.java#L26-L29) checks `vendors.acme.bearer-token`. A blank value throws `VendorIntegrationException`; a configured token allows REST payload retrieval and normalization. |
+| Northwind authentication | First instruction inside Northwind `fetchMetrics` | [`NorthwindGraphQlVendorMetricClient.fetchMetrics`](src/main/java/com/example/iot/vendor/NorthwindGraphQlVendorMetricClient.java#L33-L38) checks `vendors.northwind.api-key`. A blank value throws `VendorIntegrationException` before rate-limit accounting or metric retrieval. |
+| Rate limit | After Northwind authentication and before the payload is produced | Northwind calls [`enforceRateLimit`](src/main/java/com/example/iot/vendor/NorthwindGraphQlVendorMetricClient.java#L42-L45). It resets the counter when the one-minute window expires, increments the current window count, and throws when the configured `max-requests-per-minute` is exceeded. |
+| Reliability simulation | After Northwind authentication and rate-limit validation | [`NorthwindGraphQlVendorMetricClient.fetchMetrics`](src/main/java/com/example/iot/vendor/NorthwindGraphQlVendorMetricClient.java#L35-L36) throws a temporary-availability `VendorIntegrationException` every configured $n$ requests when `fail-every-requests` is greater than zero. |
+| Failure isolation | Around the complete adapter/capability/metric-save block | [`CollectionService.collect`](src/main/java/com/example/iot/service/CollectionService.java#L34-L44) catches the expected runtime failure for only the current appliance, increments `failedCollections`, and continues its loop. The appliance's `lastCollectedAt` is not advanced, so a later scheduled run can retry it. |
+
+The local simulation values are in [application.yml](src/main/resources/application.yml). They are deliberately non-secret development defaults. In production, the same adapter boundary would retrieve credentials from a secret manager and make real HTTP calls, while preserving the normalized `VendorMetric` output used by persistence and reports.
+
 ### Stored Metric Record
 
 [`MetricObservation`](src/main/java/com/example/iot/domain/MetricObservation.java#L6-L12) is the historical table model. Every record contains:
